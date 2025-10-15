@@ -122,6 +122,8 @@ fi
 
 ## Some tips:
 
+How to resume your training? Simply set `experiment.start_from_scratch = False` and `experiment.current_epoch` as your last RL step.
+
 ### For TraDo and SDAR models:
 
 For model with large block size, use `max_active` smaller, like 16 for block size of 64.
