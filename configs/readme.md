@@ -126,6 +126,8 @@ How to resume your training? Simply set `experiment.start_from_scratch = False` 
 
 For model with large block size, use `max_active` smaller, like 16 for block size of 64.
 
+If you have stagnation during inference, decrease `max_active`.
+
 If you find RL training not stable, a common issue for RL, try increase `gradient_accumulation_steps`, `num_task_per_step`, and `num_response_per_task`. Note that in Open-Reaonser-Zero's experiments for llm, even using `gradient_update_step=1` (number of training/update step per RL step), `num_task_per_step=128` and `num_response_per_task=64` with GRPO, the training can be potentially instable (they use value model to stablize).
 
 
