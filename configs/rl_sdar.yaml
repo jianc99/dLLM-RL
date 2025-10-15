@@ -93,7 +93,7 @@ evaluation:
     eval_dataset: "MATH500"  # "MATH500" "LiveCodeBench"
     data_type: "math" # "math" "code"
     tensor_parallel_size: 1
-    max_active: 256
+    max_active: 16
     num_response_per_task: 3
     temperature: 1.0
     max_token: 2000
