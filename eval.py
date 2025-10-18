@@ -46,6 +46,14 @@ if __name__ == "__main__":
                 cwd='sample',
                 check=True,
             )
+        elif model_base == "sdar_ar":
+            subprocess.run(
+                f'python sdar_sample_ar.py '
+                f'config=../configs/{project_name}.yaml ',
+                shell=True,
+                cwd='sample',
+                check=True,
+            )
         elif model_base == "trado":
             subprocess.run(
                 f'python trado_sample.py '

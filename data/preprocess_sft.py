@@ -41,6 +41,6 @@ len(processed_data)
 
 #with open("./sft_openr1math_dream.json", "w", encoding="utf-8") as f:
 #with open("./sft_openr1math_llada.json", "w", encoding="utf-8") as f:
-with open("./sft_openr1math_trado.json", "w", encoding="utf-8") as f:
-# with open("./sft_openr1math_sdar.json", "w", encoding="utf-8") as f:
+# with open("./sft_openr1math_trado.json", "w", encoding="utf-8") as f:
+with open("./sft_openr1math_sdar.json", "w", encoding="utf-8") as f:
     json.dump(processed_data, f, indent=2, ensure_ascii=False)
