@@ -5,7 +5,7 @@ _os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
 # Consolidate all caches into the local high-speed disk (NVMe or /dev/shm)
 # Local high-speed cache (NVMe or /dev/shm)
-_cache_root = "/workspace/tmp/shm/torch_cache"       # or "/local_nvme/torch_cache"
+_cache_root = "/data02/home/zhijian/jian/tmp/shm/torch_cache"       # or "/local_nvme/torch_cache"
 _os.makedirs(_cache_root, exist_ok=True)
 _os.environ["TORCH_EXTENSIONS_DIR"] = _os.path.join(_cache_root, "torch_extensions")
 _os.environ["TRITON_CACHE_DIR"]      = _os.path.join(_cache_root, "triton")
@@ -481,14 +481,14 @@ if __name__ == "__main__":
 
     sampling_kwargs = dict(
         temperature          = config.rollout.temperature,
-        topk                 = config.rollout.top_k,
-        topp                 = config.rollout.top_p,
+        # topk                 = config.rollout.top_k,
+        # topp                 = config.rollout.top_p,
         max_tokens           = config.rollout.max_token,
-        remasking_strategy   = config.rollout.remasking_strategy,
-        block_length         = block_size,
-        denoising_steps      = config.rollout.denoising_steps_per_block,
-        dynamic_threshold    = config.rollout.dynamic_threshold,
-        stop_words           = stop_token_id_list
+        # remasking_strategy   = config.rollout.remasking_strategy,
+        # block_length         = block_size,
+        # denoising_steps      = config.rollout.denoising_steps_per_block,
+        # dynamic_threshold    = config.rollout.dynamic_threshold,
+        # stop_words           = stop_token_id_list
     )
     max_active_local = config.rollout.max_active
 

@@ -3,3 +3,4 @@ __pycache__/
 sft_sdar/
 data/*.json
 sdar_eval/
+sft_*/

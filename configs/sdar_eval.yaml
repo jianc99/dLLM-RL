@@ -6,8 +6,8 @@ experiment:
 
 
 
-# model: "/workspace/models/JetLM/SDAR-4B-Chat-b16" # absolute path of your model
-model: "/workspace/dLLM-RL/sft_sdar/ckpt/optimized"
+model: "/data02/home/zhijian/jian/models/JetLM/SDAR-4B-Chat-b16" # absolute path of your model
+# model: "/data02/home/zhijian/jian/modified/dLLM-RL/sft_sdar_arbd_16/ckpt/optimized"
 model_base: "sdar" # set sdar for TraDo and SDAR
 
 

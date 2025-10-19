@@ -85,14 +85,14 @@ class BlockAttention(Attention):
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
             
         if context.run_type == RunType.PREFILL:
-            # o = sparse_attn_varlen(q, k, v,
-            #                     cu_seqlens_q=context.cu_seqlens_q,
-            #                     cu_seqlens_k=context.cu_seqlens_k,
-            #                     staircase_size=context.block_length)
-            o = flash_attn_varlen_func(q, k, v, cu_seqlens_k=context.cu_seqlens_k,
-                                                cu_seqlens_q=context.cu_seqlens_q,
-                                                max_seqlen_k=context.max_seqlen_k,
-                                                max_seqlen_q=context.max_seqlen_q, causal=True)
+            o = sparse_attn_varlen(q, k, v,
+                                cu_seqlens_q=context.cu_seqlens_q,
+                                cu_seqlens_k=context.cu_seqlens_k,
+                                staircase_size=context.block_length)
+            # o = flash_attn_varlen_func(q, k, v, cu_seqlens_k=context.cu_seqlens_k,
+            #                                     cu_seqlens_q=context.cu_seqlens_q,
+            #                                     max_seqlen_k=context.max_seqlen_k,
+            #                                     max_seqlen_q=context.max_seqlen_q, causal=True)
             
         else:
             q = q.view(-1, context.block_length, self.num_heads, self.head_dim)
