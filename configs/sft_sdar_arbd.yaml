@@ -4,12 +4,12 @@ wandb:
 
 
 experiment:
-    project: "sft_sdar_arbd_16" # need to be same of this file name 
+    project: "sft_sdar_arbd_64" # need to be same of this file name 
     num_node: 1 # the number of machines you have
 
 
 model:
-    pretrained_model: "/data02/home/zhijian/jian/models/JetLM/SDAR-4B-Chat-b16" # absolute path of your model
+    pretrained_model: "/home/zhijian/jian/models/JetLM/SDAR-4B-Chat-b64" # absolute path of your model
     optimized_name: "optimized" # the output name for your optimized model, will be saved under sft_sdar/ckpt
 
 
@@ -28,9 +28,9 @@ training:
     num_train_epochs: 1
     max_grad_norm: 1
     method: "semi-ar" # "semi-ar""trace"
-    lower_p: 0.1
-    upper_p: 0.9
-    block_size: 16 # the block size of your model
+    lower_p: 0.8
+    upper_p: 1.0
+    block_size: 64 # the block size of your model
     shrink: 1
     post_num: 0 # number of pad token need to be trained for each data point
     max_gen_length: 2000

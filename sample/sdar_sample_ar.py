@@ -5,7 +5,7 @@ _os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
 # Consolidate all caches into the local high-speed disk (NVMe or /dev/shm)
 # Local high-speed cache (NVMe or /dev/shm)
-_cache_root = "/data02/home/zhijian/jian/tmp/shm/torch_cache"       # or "/local_nvme/torch_cache"
+_cache_root = "/home/zhijian/jian/tmp/shm/torch_cache"       # or "/local_nvme/torch_cache"
 _os.makedirs(_cache_root, exist_ok=True)
 _os.environ["TORCH_EXTENSIONS_DIR"] = _os.path.join(_cache_root, "torch_extensions")
 _os.environ["TRITON_CACHE_DIR"]      = _os.path.join(_cache_root, "triton")
@@ -161,7 +161,7 @@ def _llm_worker_run(args):
     # (child processes inherit the sitecustomize patch)
     # from jetengine_ext.llm import LLM
     # from jetengine_ext.sampling_params import SamplingParams
-    from nanovllm import LLM, SamplingParams
+    from jetengine import LLM, SamplingParams
 
 
     llm = None
@@ -171,12 +171,14 @@ def _llm_worker_run(args):
             model_path,
             enforce_eager=enforce_eager,
             tensor_parallel_size=tp,
+            mask_token_id=151669,
+            block_length=block_size
         )
         sp = SamplingParams(**sampling_kwargs)
 
         # Keep max_active sane for each worker’s slice to avoid rare internal exits
         local_max_active = min(max_active, max(1, len(prompts_slice)))
-        outs = llm.generate(prompts_slice, sp)
+        outs = llm.generate_streaming(prompts_slice, sp, max_active=local_max_active)
 
         # Collect results incrementally so we can return partials on any exit
         for j, o in enumerate(outs):
@@ -481,14 +483,14 @@ if __name__ == "__main__":
 
     sampling_kwargs = dict(
         temperature          = config.rollout.temperature,
-        # topk                 = config.rollout.top_k,
-        # topp                 = config.rollout.top_p,
+        topk                 = config.rollout.top_k,
+        topp                 = config.rollout.top_p,
         max_tokens           = config.rollout.max_token,
-        # remasking_strategy   = config.rollout.remasking_strategy,
-        # block_length         = block_size,
-        # denoising_steps      = config.rollout.denoising_steps_per_block,
-        # dynamic_threshold    = config.rollout.dynamic_threshold,
-        # stop_words           = stop_token_id_list
+        remasking_strategy   = config.rollout.remasking_strategy,
+        block_length         = block_size,
+        denoising_steps      = config.rollout.denoising_steps_per_block,
+        dynamic_threshold    = config.rollout.dynamic_threshold,
+        stop_words           = stop_token_id_list
     )
     max_active_local = config.rollout.max_active
 
@@ -509,7 +511,7 @@ if __name__ == "__main__":
     if ngroups == 1:
         # from jetengine_ext.llm import LLM
         # from jetengine_ext.sampling_params import SamplingParams
-        from nanovllm import LLM, SamplingParams
+        from jetengine import LLM, SamplingParams
 
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, groups[0]))
         import torch
@@ -523,23 +525,25 @@ if __name__ == "__main__":
             model_path,
             enforce_eager=enforce_eager,
             tensor_parallel_size=config.rollout.tensor_parallel_size,
+            mask_token_id=151669,
+            block_length=block_size
         )
         _llm = llm
 
         # Set sampling/generation parameters
         sampling_params = SamplingParams(
             temperature=config.rollout.temperature,
-            # topk=config.rollout.top_k,
-            # topp=config.rollout.top_p,
+            topk=config.rollout.top_k,
+            topp=config.rollout.top_p,
             max_tokens=config.rollout.max_token,
-            # remasking_strategy=config.rollout.remasking_strategy,
-            # block_length=block_size,
-            # denoising_steps=config.rollout.denoising_steps_per_block,
-            # dynamic_threshold=config.rollout.dynamic_threshold,
-            # stop_words           = stop_token_id_list
+            remasking_strategy=config.rollout.remasking_strategy,
+            block_length=block_size,
+            denoising_steps=config.rollout.denoising_steps_per_block,
+            dynamic_threshold=config.rollout.dynamic_threshold,
+            stop_words           = stop_token_id_list
         )
         try:
-            outputs = llm.generate(prompt_chunks[0], sampling_params)
+            outputs = llm.generate_streaming(prompt_chunks[0], sampling_params, max_active=config.rollout.max_active)
             for j, o in enumerate(outputs):
                 seq_pairs.append( (
                     index_chunks[0][j],

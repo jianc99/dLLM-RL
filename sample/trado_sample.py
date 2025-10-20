@@ -5,7 +5,7 @@ _os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
 # Consolidate all caches into the local high-speed disk (NVMe or /dev/shm)
 # Local high-speed cache (NVMe or /dev/shm)
-_cache_root = "/workspace/tmp/shm/torch_cache"       # or "/local_nvme/torch_cache"
+_cache_root = "/home/zhijian/jian/tmp/shm/torch_cache"       # or "/local_nvme/torch_cache"
 _os.makedirs(_cache_root, exist_ok=True)
 _os.environ["TORCH_EXTENSIONS_DIR"] = _os.path.join(_cache_root, "torch_extensions")
 _os.environ["TRITON_CACHE_DIR"]      = _os.path.join(_cache_root, "triton")

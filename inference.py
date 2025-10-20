@@ -6,8 +6,11 @@ torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 torch.backends.cudnn.deterministic = True
 
-model_name_arbd = "/data02/home/zhijian/jian/modified/dLLM-RL/sft_sdar_arbd_16/ckpt/optimized"
-model_name_bd = "/data02/home/zhijian/jian/models/JetLM/SDAR-4B-Chat-b16"
+# model_name_arbd = "/home/zhijian/jian/modified/dLLM-RL/sft_sdar_arbd_64/ckpt/optimized"
+# model_name_bd = "/home/zhijian/jian/models/JetLM/SDAR-4B-Chat-b64"
+
+model_name_arbd = "/home/zhijian/jian/modified/dLLM-RL/sft_sdar_arbd_16/ckpt/optimized"
+model_name_bd = "/home/zhijian/jian/models/JetLM/SDAR-4B-Chat-b16"
 
 # model_name_arbd = "/data02/home/zhijian/jian/modified/dLLM-RL/sft_sdar_arbd_8/ckpt/optimized"
 # model_name_bd = "/data02/home/zhijian/jian/models/JetLM/SDAR-8B-Chat-b8"
@@ -58,7 +61,7 @@ output_ids_arbd = block_diffusion_generate_ar_verify(
     gen_length=1024,
     block_length=16, denoising_steps=1,
     temperature=1.0, top_k=1, top_p=1.0,
-    confidence_threshold=0.9,
+    confidence_threshold=0.7,
     stopping_criteria_idx = [151645]
 )
 
