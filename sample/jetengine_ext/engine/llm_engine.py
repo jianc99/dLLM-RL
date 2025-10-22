@@ -110,7 +110,7 @@ class LLMEngine:
         #finished_outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_seqs if seq.is_finished]
         
         finished_outputs = [
-            (seq.seq_id, seq.completion_token_ids, seq.first_unmask_steps)
+            (seq.seq_id, seq.completion_token_ids, seq.first_unmask_steps, seq.number_forward_pass)
             for seq in scheduled_seqs
             if seq.is_finished
         ]
@@ -277,6 +277,9 @@ class LLMEngine:
             if profile else nullcontext()
         )
 
+        global_forward_pass = 0
+        global_generated_length = 0
+
         with prof_ctx as prof:
             while not self.is_finished() or pending_idx < total:
                 # Top up to capacity before each step
@@ -299,11 +302,14 @@ class LLMEngine:
 
                 #for seq_id, token_ids in output:
                 #    outputs[seq_id] = token_ids
-                for seq_id, token_ids, unmask_times in output:
+                for seq_id, token_ids, unmask_times, num_forward_pass in output:
                     outputs[seq_id] = {"token_ids": token_ids, "unmask_times": unmask_times}
+                    global_generated_length += len(token_ids)
+                    global_forward_pass += num_forward_pass
 
         #outputs_list = [outputs[seq_id] for seq_id in sorted(outputs)]
         #results = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs_list]
+        print(f"Average number of tokens generated per forward pass: {global_generated_length / global_forward_pass:.2f}")
         outputs_list = [outputs[seq_id] for seq_id in sorted(outputs)]
         results = [
             {

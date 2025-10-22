@@ -43,6 +43,7 @@ class Sequence:
         self.first_unmask_steps: list[int] = []
         self.block_first_unmask_steps: list[int] | None = [0] * len(self.intermediate_block_tokens)
         self.global_denoising_step = 0
+        self.number_forward_pass = 0
         
         # initial status based on whether prefill is needed.
         if self.num_prefill_tokens > 0:

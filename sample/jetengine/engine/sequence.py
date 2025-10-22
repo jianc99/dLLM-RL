@@ -37,6 +37,7 @@ class Sequence:
         self.intermediate_block_tokens = [mask_token_id] * self.block_length
         self.num_to_transfer = 0
         self.current_denoising_step = 0
+        self.number_forward_pass = 0
         
         # initial status based on whether prefill is needed.
         if self.num_prefill_tokens > 0:
@@ -55,6 +56,7 @@ class Sequence:
         self.remasking_strategy = sampling_params.remasking_strategy
         self.dynamic_threshold = sampling_params.dynamic_threshold
         self.eb_threshold = sampling_params.eb_threshold
+        self.ar_temperature = sampling_params.ar_temperateure
         self.mask_token_id = mask_token_id
         self.num_transfer_tokens_per_step = self._get_num_transfer_tokens()
 

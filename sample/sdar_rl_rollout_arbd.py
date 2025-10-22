@@ -3,14 +3,16 @@ _os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
 
 
+
 # Consolidate all caches into the local high-speed disk (NVMe or /dev/shm)
 # Local high-speed cache (NVMe or /dev/shm)
-_cache_root = "/home/zhijian/jian/tmp/shm/torch_cache"       # or "/local_nvme/torch_cache"
+_cache_root = "/home/zhijian/jian/tmp/torch_cache"       # or "/local_nvme/torch_cache"
 _os.makedirs(_cache_root, exist_ok=True)
 _os.environ["TORCH_EXTENSIONS_DIR"] = _os.path.join(_cache_root, "torch_extensions")
 _os.environ["TRITON_CACHE_DIR"]      = _os.path.join(_cache_root, "triton")
 _os.environ["XDG_CACHE_HOME"]        = _cache_root
 _os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
+
 
 
 _os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
@@ -74,19 +76,12 @@ def extract_code(full_output):
     return code_output
 
 
-'''
 def get_data_chunk(data, num_node, node_idx):
     total = len(data)
     chunk_size = (total + num_node - 1) // num_node 
     start_idx = node_idx * chunk_size
     end_idx = min((node_idx + 1) * chunk_size, total)
     return data[start_idx:end_idx]
-'''
-def get_data_chunk(data, num_nodes, node_idx):
-    total = len(data)
-    start = (total * node_idx) // num_nodes
-    end   = (total * (node_idx + 1)) // num_nodes
-    return data[start:end]
 
 
 import socket
@@ -159,43 +154,33 @@ def _llm_worker_run(args):
 
     # 3) Import jetengine and create the engine 
     # (child processes inherit the sitecustomize patch)
-    # from jetengine_ext.llm import LLM
-    # from jetengine_ext.sampling_params import SamplingParams
-    from nanovllm import LLM, SamplingParams
+    from jetengine.llm import LLM
+    from jetengine.sampling_params import SamplingParams
 
-
-    llm = None
+    llm = LLM(
+        model_path,
+        enforce_eager=enforce_eager,
+        tensor_parallel_size=tp,
+        mask_token_id=151669,
+        block_length=block_size
+    )
+    sp = SamplingParams(**sampling_kwargs)
+    outs = llm.generate_streaming(prompts_slice, sp, max_active=max_active)
+    #seq = [o["text"] for o in outs]
+    #print(outs[0]["first_unmask_times"])
     triples = []
+    for j, o in enumerate(outs):
+        triples.append((
+            indices_slice[j],          # Global index (used to restore original order)
+            o["text"],                 # Generated text
+            o.get("first_unmask_times", None)  # Optional time series aligned with completion tokens
+        ))
+
     try:
-        llm = LLM(
-            model_path,
-            enforce_eager=enforce_eager,
-            tensor_parallel_size=tp,
-            # mask_token_id=151669,
-            # block_length=block_size
-        )
-        sp = SamplingParams(**sampling_kwargs)
-
-        # Keep max_active sane for each worker’s slice to avoid rare internal exits
-        local_max_active = min(max_active, max(1, len(prompts_slice)))
-        outs = llm.generate(prompts_slice, sp)
-
-        # Collect results incrementally so we can return partials on any exit
-        for j, o in enumerate(outs):
-            triples.append((
-                indices_slice[j],
-                o["text"],
-                o.get("first_unmask_times", None)
-            ))
-    except BaseException as e:
-        # Swallow SystemExit/KeyboardInterrupt/etc. so we can return partials
-        print(f"[worker pid={os.getpid()}] Caught {type(e).__name__}: {e}. Returning partial results ({len(triples)})", flush=True)
-    finally:
-        try:
-            if llm is not None and hasattr(llm, "shutdown"):
-                llm.shutdown()
-        except Exception:
-            pass
+        if hasattr(llm, "shutdown"):
+            llm.shutdown()
+    except Exception:
+        pass
 
     return triples
 
@@ -205,19 +190,13 @@ def _llm_worker_entry(args, out_q):
     import traceback, os
     try:
         res = _llm_worker_run(args)
-        # Even if partial, report as 'ok' so parent can use what we have
         out_q.put(("ok", res))
-    except BaseException:
-        tb = traceback.format_exc()
-        # Fall back to 'err' path if even the call above exploded
-        try:
-            out_q.put(("err", {
-                "pid": os.getpid(),
-                "port": args[-1],
-                "traceback": tb,
-            }))
-        except Exception:
-            pass
+    except Exception:
+        out_q.put(("err", {
+            "pid": os.getpid(),
+            "port": args[-1],  # store_port
+            "traceback": traceback.format_exc(),
+        }))
 
 
 def _find_free_port():
@@ -238,12 +217,14 @@ def _patch_dist_port(port: int):
     _dist.init_process_group = _wrapped
 
 
+import random 
+def random_select(data_list, random_k):
+    data_list = random.sample(data_list, random_k)
+    return data_list
 
 if __name__ == "__main__":
 
-    config = get_config()
 
-    
 
     tp = int(get_config().rollout.tensor_parallel_size)  # Or check after loading config
 
@@ -269,6 +250,7 @@ if __name__ == "__main__":
 
     # --- graceful shutdown & unique port ---
     import os, sys, atexit, signal, torch.distributed as dist
+
 
     # 2) Automatically set compile architecture according to the local GPU
     # (do NOT hardcode 8.0)
@@ -330,6 +312,9 @@ if __name__ == "__main__":
 
 
 
+
+    config = get_config()
+
     try:
         if mp.get_start_method(allow_none=True) != "spawn":
             mp.set_start_method("spawn", force=True)
@@ -337,46 +322,79 @@ if __name__ == "__main__":
         pass
 
     
-    k_sample = config.rollout.num_response_per_task
-    # non-cot prompt
-    #system_prompts = '''<|im_start|>user\nYou need to put your final answer in \\boxed{}. This is the problem:\n{{problem}}<|im_end|>\n<|im_start|>assistant\n'''
-    # cot prompt
+    
     system_prompts = '''<|im_start|>user\n{{problem}}\nPlease reason step by step, and put your final answer within \\boxed{}.<|im_end|>\n<|im_start|>assistant\n'''
     if config.rollout.start_with_think:
         system_prompts = '''<|im_start|>user\nYou need to put your final answer in \\boxed{}. This is the problem:\n{{problem}}<|im_end|>\n<|im_start|>assistant<think>\n'''
-    
+
+
     project_name = config.experiment.project
 
-    code_eval = False
+    if config.experiment.current_epoch == 1:
+        pretrained_model = config.model.pretrained_model
+    else:
+        pretrained_model = "../" + project_name + "/ckpt/" + config.model.optimized_name
 
-    dataset = config.dataset.eval_dataset
-    pretrained_model = config.model
-    if config.dataset.data_type == "code":
-        code_eval = True
-        system_prompts_function = '''<|im_start|>user\n{{problem}}\nPlace your code within a single Python code block ```python ```. Do not include more than one code block. <|im_end|>\n<|im_start|>assistant\n'''
-        system_prompts_stdio = '''<|im_start|>user\nThis is the problem:\n{{problem}}\nYou should put your code in ```python ```. Use input() to read input and print() to produce output in your script. <|im_end|>\n<|im_start|>assistant\n'''
-        if config.rollout.start_with_think:
-            system_prompts_stdio = '''<|im_start|>user\nThis is the problem:\n{{problem}}\nYou should put your code in ```python ```. Use input() to read input and print() to produce output in your script. <|im_end|>\n<|im_start|>assistant<think>\n'''
-    elif config.dataset.data_type == "option":
-        system_prompts = '''<|im_start|>user\nThis is the problem:\n{{problem}}\nYou need to think step by step and put the final option (A, B, C, or D only—no other character) in \\boxed{}. <|im_end|>\n<|im_start|>assistant\n'''
-        if config.rollout.start_with_think:
-            system_prompts = '''<|im_start|>user\nThis is the problem:\n{{problem}}\nYou need to think step by step and put the final option (A, B, C, or D only—no other character) in \\boxed{}. <|im_end|>\n<|im_start|>assistant<think>\n'''
+    code_task = False
+    if config.experiment.function == "train":
+        dataset = config.dataset.train_dataset
+        k_sample = config.rollout.num_response_per_task
+
+        if config.dataset.data_type == "code":
+            code_task = True
+            system_prompts_function = '''<|im_start|>user\n{{problem}}\nPlace your code within a single Python code block ```python ```. Do not include more than one code block. <|im_end|>\n<|im_start|>assistant\n'''
+            system_prompts_stdio = '''<|im_start|>user\nThis is the problem:\n{{problem}}\nYou should put your code in ```python ```. Use input() to read input and print() to produce output in your script. <|im_end|>\n<|im_start|>assistant\n'''
+            if config.rollout.start_with_think:
+                system_prompts_stdio = '''<|im_start|>user\nThis is the problem:\n{{problem}}\nYou should put your code in ```python ```. Use input() to read input and print() to produce output in your script. <|im_end|>\n<|im_start|>assistant<think>\n'''
+
+        outputs_name = "rl-" + pretrained_model.replace("/", ".") + "-" + dataset
+        
+    elif config.experiment.function == "evaluation":
+        dataset = config.evaluation.eval_dataset
+        if config.evaluation.data_type == "code":
+            code_task = True
+            system_prompts_function = '''<|im_start|>user\n{{problem}}\nPlace your code within a single Python code block ```python ```. Do not include more than one code block. <|im_end|>\n<|im_start|>assistant\n'''
+            system_prompts_stdio = '''<|im_start|>user\nThis is the problem:\n{{problem}}\nYou should put your code in ```python ```. Use input() to read input and print() to produce output in your script. <|im_end|>\n<|im_start|>assistant\n'''
+            if config.rollout.start_with_think:
+                system_prompts_stdio = '''<|im_start|>user\nThis is the problem:\n{{problem}}\nYou should put your code in ```python ```. Use input() to read input and print() to produce output in your script. <|im_end|>\n<|im_start|>assistant<think>\n'''
+
+        k_sample = config.evaluation.num_response_per_task
+
+        config.rollout.tensor_parallel_size = config.evaluation.tensor_parallel_size
+        config.rollout.max_active = config.evaluation.max_active
+        config.rollout.max_token = config.evaluation.max_token
+        config.rollout.remasking_strategy = config.evaluation.remasking_strategy
+        config.rollout.dynamic_threshold = config.evaluation.dynamic_threshold
+        config.rollout.denoising_steps_per_block = config.evaluation.denoising_steps_per_block
+        config.rollout.temperature = config.evaluation.temperature
+        config.rollout.top_p = config.evaluation.top_p
+        config.rollout.top_k = config.evaluation.top_k
+        config.rollout.block_size = config.evaluation.block_size
+        config.rollout.ar_temperature = config.evaluation.ar_temperature
+
+        outputs_name = "eval-" + pretrained_model.replace("/", ".") + "-" + dataset
     
-    outputs_name = "eval-" + pretrained_model.replace("/", ".") + "-" + dataset
+
+    
 
     with open("../data/" + dataset + ".json", 'r') as f:
         data = json.load(f)
-    #data = [data[i] for i in range(100, 300)]
-    #data = data[400:]
+    #data = [data[i] for i in range(8)]
 
     num_node = config.experiment.num_node
     node_index = config.experiment.node_index
     if num_node > 1:
-        #random.shuffle(data)
+        if config.experiment.function == "train":
+            random.shuffle(data)
         data = get_data_chunk(data, num_node, node_index)
-    
-    num = len(data)
 
+
+    if config.experiment.function == "train":
+        random_select_num = config.rollout.num_task_per_step
+        random_select_num = int(random_select_num / num_node)
+        random_select_num = min(random_select_num, len(data))
+        data = random_select(data, random_select_num)
+    num = len(data)
 
     model_path = os.path.expanduser(pretrained_model)
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -386,11 +404,7 @@ if __name__ == "__main__":
     
 
 
-    
 
-    
-
-    
 
 
 
@@ -400,7 +414,7 @@ if __name__ == "__main__":
     index_list = []
     for i in range(num):
         # preprocess
-        if code_eval:
+        if code_task:
             if data[i]["test_method"] == "stdio":
                 system_prompts = system_prompts_stdio
                 prefix_list = prefix_list + [None] * k_sample
@@ -453,44 +467,16 @@ if __name__ == "__main__":
     
     groups = [ device_ids[i*tp : (i+1)*tp] for i in range(ngroups) ]
 
-
-
-    def to_single_token_stop_ids(tokenizer, stop_token_list):
-        if not stop_token_list:
-            return []
-        ids, seen = [], set()
-        for s in stop_token_list:
-            if isinstance(s, int):
-                tid = [s]
-            elif isinstance(s, str):
-                tid = tokenizer.encode(s, add_special_tokens=False)
-            elif isinstance(s, (list, tuple)) and all(isinstance(x, int) for x in s):
-                tid = list(s)
-            else:
-                continue  
-            if len(tid) == 1:
-                t = tid[0]
-                if t not in seen:
-                    seen.add(t)
-                    ids.append(t)
-        return ids
-    
-    from omegaconf import MISSING
-    if OmegaConf.select(config, "rollout.stop_token_list", default=MISSING) is not MISSING:
-        stop_token_id_list = to_single_token_stop_ids(tokenizer, config.rollout.stop_token_list)
-    else:
-        stop_token_id_list = []
-
     sampling_kwargs = dict(
         temperature          = config.rollout.temperature,
-        # topk                 = config.rollout.top_k,
-        # topp                 = config.rollout.top_p,
+        topk                 = config.rollout.top_k,
+        topp                 = config.rollout.top_p,
         max_tokens           = config.rollout.max_token,
-        # remasking_strategy   = config.rollout.remasking_strategy,
-        # block_length         = block_size,
-        # denoising_steps      = config.rollout.denoising_steps_per_block,
-        # dynamic_threshold    = config.rollout.dynamic_threshold,
-        # stop_words           = stop_token_id_list
+        remasking_strategy   = config.rollout.remasking_strategy,
+        block_length         = block_size,
+        denoising_steps      = config.rollout.denoising_steps_per_block,
+        dynamic_threshold    = config.rollout.dynamic_threshold,
+        ar_temperateure         = config.rollout.ar_temperature,
     )
     max_active_local = config.rollout.max_active
 
@@ -509,9 +495,8 @@ if __name__ == "__main__":
     seq_pairs = []
 
     if ngroups == 1:
-        # from jetengine_ext.llm import LLM
-        # from jetengine_ext.sampling_params import SamplingParams
-        from nanovllm import LLM, SamplingParams
+        from jetengine.llm import LLM
+        from jetengine.sampling_params import SamplingParams
 
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, groups[0]))
         import torch
@@ -525,25 +510,25 @@ if __name__ == "__main__":
             model_path,
             enforce_eager=enforce_eager,
             tensor_parallel_size=config.rollout.tensor_parallel_size,
-            # mask_token_id=151669,
-            # block_length=block_size
+            mask_token_id=151669,   # Optional: only needed for masked/diffusion models
+            block_length=block_size
         )
         _llm = llm
 
         # Set sampling/generation parameters
         sampling_params = SamplingParams(
             temperature=config.rollout.temperature,
-            # topk=config.rollout.top_k,
-            # topp=config.rollout.top_p,
+            topk=config.rollout.top_k,
+            topp=config.rollout.top_p,
             max_tokens=config.rollout.max_token,
-            # remasking_strategy=config.rollout.remasking_strategy,
-            # block_length=block_size,
-            # denoising_steps=config.rollout.denoising_steps_per_block,
-            # dynamic_threshold=config.rollout.dynamic_threshold,
-            # stop_words           = stop_token_id_list
+            remasking_strategy=config.rollout.remasking_strategy,
+            block_length=block_size,
+            denoising_steps=config.rollout.denoising_steps_per_block,
+            dynamic_threshold=config.rollout.dynamic_threshold,
+            ar_temperateure=config.rollout.ar_temperature,
         )
         try:
-            outputs = llm.generate(prompt_chunks[0], sampling_params)
+            outputs = llm.generate_streaming(prompt_chunks[0], sampling_params, max_active=config.rollout.max_active)
             for j, o in enumerate(outputs):
                 seq_pairs.append( (
                     index_chunks[0][j],
@@ -553,12 +538,19 @@ if __name__ == "__main__":
         finally:
             _cleanup()
     else:
-        import time
         ctx = mp.get_context("spawn")
         enforce_eager_local = False if tp > 1 else True
 
-        base_port = 29000
-        store_ports = [base_port + g for g in range(ngroups)]
+        store_ports = []
+        for _ in range(ngroups):
+            # Ensure each worker gets a rendezvous port that is actually free to avoid EADDRINUSE.
+            for _ in range(16):
+                candidate = _find_free_port()
+                if candidate not in store_ports:
+                    store_ports.append(candidate)
+                    break
+            else:
+                raise RuntimeError("Failed to allocate a unique rendezvous port for rollout workers.")
 
         out_q = ctx.Queue()
         procs = []
@@ -572,9 +564,8 @@ if __name__ == "__main__":
             )
             p = ctx.Process(target=_llm_worker_entry, args=(args, out_q), daemon=False)
             p.start()
-            #time.sleep(2)
             procs.append(p)
-            _child_ps.append(p)   
+            _child_ps.append(p)  
 
         import queue, time
 
@@ -583,7 +574,7 @@ if __name__ == "__main__":
 
         while results_got < results_needed:
             try:
-                kind, payload = out_q.get(timeout=3600 * 24) 
+                kind, payload = out_q.get(timeout=1800)
             except queue.Empty:
                 dead = [p for p in procs if not p.is_alive()]
                 if dead:
@@ -667,7 +658,7 @@ if __name__ == "__main__":
     # process generated codes
     i = 0
     for full_output in restored_outputs:
-        if code_eval:
+        if code_task:
             if data[int(i/k_sample)]["test_method"] == "function":
                 extracted_output = extract_code(prefix_list[i] + full_output)
             else:
@@ -691,6 +682,5 @@ if __name__ == "__main__":
     os.makedirs(os.path.dirname(output_file_name), exist_ok=True)
     with open(output_file_name, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-
 
 

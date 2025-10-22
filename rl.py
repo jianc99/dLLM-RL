@@ -61,6 +61,8 @@ if __name__ == "__main__":
             script_name = "sdar_rl_rollout.py"
         elif model_base == "trado":
             script_name = "trado_rl_rollout.py"
+        elif model_base == "sdar_arbd":
+            script_name = "sdar_rl_rollout_arbd.py"
         subprocess.run(
             f'python {script_name} '
             f'config=../configs/{project_name}.yaml '
@@ -116,6 +118,8 @@ if __name__ == "__main__":
                 script_name = "rl_sdar.py"
             elif model_base == "trado":
                 script_name = "rl_trado.py"
+            elif model_base == "sdar_arbd":
+                script_name = "rl_sdar_arbd.py"
         elif target == "policy":
             if model_base == "sdar":
                 script_name = "train_sdar_policy.py"
@@ -162,7 +166,7 @@ if __name__ == "__main__":
             train(i, target = None)
 
         if i % config.experiment.eval_every == 0:
-            if model_base in ["sdar", "trado"]:
+            if model_base in ["sdar", "trado", "sdar_arbd"]:
                 remasking_strategy_list = config.evaluation.remasking_strategy
                 top_k_list = config.evaluation.top_k
                 block_size = config.evaluation.block_size

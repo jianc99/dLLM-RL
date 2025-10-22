@@ -6,7 +6,7 @@ class SamplingParams:
     temperature: float = 1.0
     max_tokens: int = 64
     ignore_eos: bool = False
-
+    ar_temperateure: float = 1.0  # Specific to ARBD models
     # Block Diffusion Parameters
     block_length: int = 4
     denoising_steps: int = 4

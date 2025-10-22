@@ -79,7 +79,7 @@ class Scheduler:
 
     def postprocess(self, seqs: list[Sequence], logits: torch.Tensor, run_type: RunType):
         if run_type == RunType.PREFILL:
-            probs = self.sample_pipe_topk0(logits, temperature=0.6, top_p=1.0)
+            probs = self.sample_pipe_topk0(logits, temperature=seqs[0].ar_temperature, top_p=1.0)
             start_idx = 0
             for seq in seqs:
                 bonus_token = torch.multinomial(probs[start_idx], num_samples=1).item()
@@ -90,7 +90,7 @@ class Scheduler:
         
         elif run_type == RunType.VERIFY:
             start_idx = 0
-            probs = self.sample_pipe_topk0(logits, temperature=0.6, top_p=1.0)
+            probs = self.sample_pipe_topk0(logits, temperature=seqs[0].ar_temperature, top_p=1.0)
             for seq in seqs:
                 block_len = seq.block_length
                 AR_tokens = torch.multinomial(probs[start_idx : start_idx + block_len], num_samples=1).squeeze(-1)
@@ -112,6 +112,7 @@ class Scheduler:
                     seq.start_new_block()
                     seq.intermediate_block_tokens[0] = bonus_token.item()
                 start_idx += seq.block_length
+                seq.number_forward_pass += 1
 
         
         elif run_type == RunType.DENOISE:
@@ -197,6 +198,7 @@ class Scheduler:
                     # Block is done, commit it and check if generation is finished
                     seq.status = SequenceStatus.FINISHED if seq.is_finished else SequenceStatus.SAVING
                 seq.num_to_transfer = num_to_transfer
+                seq.number_forward_pass += 1
 
                 start_idx += seq.block_length
                 

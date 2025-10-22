@@ -2,7 +2,6 @@ import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
-
 import json
 import logging
 import math
@@ -24,8 +23,8 @@ from accelerate.logging import get_logger
 from accelerate.utils import DistributedType, set_seed
 
 
+
 from models import SDARForCausalLM
-from transformers import AutoTokenizer
 from train.prompting_utils import UniversalPrompting
 from models.lr_schedulers import get_scheduler
 from models.logging import set_verbosity_info, set_verbosity_error
@@ -52,23 +51,34 @@ logger = get_logger(__name__, log_level="INFO")
 
 
 class TrainDataset(Dataset):
-    def __init__(self, extended_input_ids, p_mask, tok_idx_ext, labels, p_mask_ar):
+    def __init__(self, extended_input_ids, p_mask, tok_idx_ext, labels, reward, p_mask_ar):
         self.extended_input_ids = extended_input_ids
         self.p_mask = p_mask
         self.tok_idx_ext = tok_idx_ext
         self.labels = labels
         self.p_mask_ar = p_mask_ar
+        self.reward   = reward
+        self.logp_old_tok_bd = torch.full(
+            (len(extended_input_ids), p_mask.shape[1]), 
+            float('-inf')
+        )
+        self.logp_old_tok_ar = torch.full(
+            (len(extended_input_ids), p_mask.shape[1] - 1), 
+            float('-inf')
+        )
 
     def __len__(self):
         return len(self.extended_input_ids)
 
     def __getitem__(self, idx):
         return (
+            idx,
             self.extended_input_ids[idx],
             self.p_mask[idx],
             self.tok_idx_ext[idx],
             self.labels[idx],
-            self.p_mask_ar[idx]
+            self.reward[idx],
+            self.p_mask_ar[idx],
         )
 
 
@@ -79,7 +89,10 @@ def main():
     config = get_config()
 
     project_name = config.experiment.project
-    pretrained_model = config.model.pretrained_model
+    if config.experiment.current_epoch == 1:
+        pretrained_model = config.model.pretrained_model
+    else:
+        pretrained_model = "./" + project_name + "/ckpt/" + config.model.optimized_name
 
     # Enable TF32 on Ampere GPUs
     if config.training.enable_tf32:
@@ -161,7 +174,7 @@ def main():
 
     # calculate loss ourselves, needs logits，so aviod fuse CE
     if hasattr(model, "config"):
-        model.config.fuse_cross_entropy = False  
+        model.config.fuse_cross_entropy = False   
     
 
     if config.training.gradient_checkpointing_enable:
@@ -233,46 +246,52 @@ def main():
 
 
     def simple_collate(batch):
-        extended_input_ids, p_mask, tok_idx_ext, labels, p_mask_ar = zip(*batch)     # Tensor(L)
+        idx, extended_input_ids, p_mask, tok_idx_ext, labels, reward, p_mask_ar = zip(*batch)
         return {
+            "ids":        torch.tensor(idx),
             "extended_input_ids":  torch.stack(extended_input_ids),
             "p_mask":  torch.stack(p_mask),
             "tok_idx_ext":  torch.stack(tok_idx_ext),
             "labels":  torch.stack(labels),
-            "p_mask_ar": torch.stack(p_mask_ar)
+            "reward":     reward,
+            "p_mask_ar": torch.stack(p_mask_ar),
         }
     
 
 
     
-    with open("./data/" + config.dataset.optimization_data + ".json", 'r') as f:
+    with open("./" + project_name + "/temp_data/" + config.dataset.optimization_data + ".json", 'r') as f:
         dataset_load = json.load(f)
-    #dataset_load = dataset_load[10000:20000]
+    #dataset_load = dataset_load[:2000]
 
     prompt_list = []
     response_list = []
     step_map_list = []
+    reward_list = []
     for x in dataset_load:
         prompt_list.append(x["prompt"])
         response_list.append(x["response"])
+        reward_list.append(x["reward"])
     
     input_ids_lm, _, start_pos, drop_num = uni_prompting((prompt_list, response_list))
+
 
     _, L = input_ids_lm.shape
     L0    = start_pos
     L1    = L - L0
     post_num = config.training.post_num
 
-    for x in dataset_load:
-        if "step_map" not in x.keys():
-            step_map_list.append([j for j in range(L1)])
-        else:
-            step_map_i = x["step_map"]
-            if len(step_map_i) > L1:
-                step_map_i = step_map_i[:L1]
-            else:
-                step_map_i = step_map_i + [max(step_map_i) + 1] * (L1 - len(step_map_i))
-            step_map_list.append(step_map_i)
+
+    # for x in dataset_load:
+    #     if "step_map" not in x.keys():
+    #         step_map_list.append([j for j in range(L1)])
+    #     else:
+    #         step_map_i = x["step_map"]
+    #         if len(step_map_i) > L1:
+    #             step_map_i = step_map_i[:L1]
+    #         else:
+    #             step_map_i = step_map_i + [max(step_map_i) + 1] * (L1 - len(step_map_i))
+    #         step_map_list.append(step_map_i)
 
     
     
@@ -364,7 +383,70 @@ def main():
 
 
 
-    def collect_training_data(input_ids, step_map_list):
+    def one_round_vectorized(input_ids_b, step_map_b, L0, L1, block_size, mask_id):
+        """
+        Perform a single "round" on one sample b:
+        - For each block, take the minimum non -1 value in step_map.
+        - Create pmask (positions equal to the block minimum).
+        - Create a noise mask for the extended segment (positions >= block minimum).
+        - Mark the chosen minimum positions in step_map as -1 for the next round.
+
+        Returns:
+        extended_input_ids_b : Tensor with duplicated + masked response segment
+        pmask_b              : Boolean mask for tokens selected in this round
+        new_step_map_b       : Updated step_map (selected positions set to -1)
+        has_any              : Whether any position was selected in this round
+        """
+        device = input_ids_b.device
+        NB = (L1 + block_size - 1) // block_size
+        pad_len = NB * block_size - L1
+
+        # Reshape step_map into [NB, block_size], fill last incomplete block with -1
+        step_pad = torch.full((NB * block_size,), -1, dtype=torch.long, device=device)
+        step_pad[:L1] = step_map_b
+        step_blk = step_pad.view(NB, block_size)                      # [NB, Bk]
+
+        valid = step_blk.ge(0)                                        # Valid positions (not -1)
+        big = torch.iinfo(step_blk.dtype).max
+        tmp = step_blk.masked_fill(~valid, big)                       # Fill invalid positions with a large value
+        min_vals, _ = tmp.min(dim=1, keepdim=True)                    # Current minimum for each block
+
+        # Select positions equal to block minimum (only valid positions)
+        pmask_blk = step_blk.eq(min_vals) & valid                     
+        if not pmask_blk.any():
+            # No positions left to select in this round
+            return None, None, step_map_b, False
+
+        # Noise mask for extended segment: mark positions >= block minimum
+        ge_mask_blk = step_blk.ge(min_vals) & valid                   # [NB, Bk]
+
+        # Flatten back to length L1 (discard padding)
+        pmask_tail = pmask_blk.view(-1)[:L1]                          # [L1]
+        ge_mask_tail = ge_mask_blk.view(-1)[:L1]                      # [L1]
+
+        # Construct pmask_b: [0:L0] = False, [L0:] = pmask_tail
+        pmask_b = torch.zeros(L0 + L1, dtype=torch.bool, device=device)
+        pmask_b[L0:] = pmask_tail
+
+        # Build extended segment: duplicate response and replace noise positions with mask_id
+        tail = input_ids_b[L0:L0+L1].clone()
+        tail[ge_mask_tail] = mask_id
+
+        
+        extended_input_ids_b = torch.empty(L0 + L1 + L1, dtype=input_ids_b.dtype, device=device)
+        extended_input_ids_b[:L0+L1] = input_ids_b
+        extended_input_ids_b[L0+L1:] = tail
+
+        # Update step_map: mark selected minimum positions as -1 for the next round
+        new_step_map_b = step_map_b.clone()
+        new_step_map_b[pmask_tail] = -1
+
+        return extended_input_ids_b, pmask_b, new_step_map_b, True
+    
+
+
+
+    def collect_training_data(input_ids, step_map_list, reward):
 
         B, L = input_ids.shape
         L0    = start_pos
@@ -373,39 +455,121 @@ def main():
 
         lower = config.training.lower_p
         upper = config.training.upper_p
+
+
         
-        extended_input_ids_list, pmask_list, pmask_ar_list = [], [], []
+        if config.training.method == "random_masking":
 
-        # Pre-compute the global linear probability
-        
+            extended_input_ids_list, pmask_list, reward_list, pmask_ar_list = [], [], [], []
 
-        for b in range(B):
+            for b in range(B):
 
-            prob_ramp = torch.empty(L1).uniform_(lower, upper)
+                reward_list.append(reward[b])
+
+                extended_input_ids_b = input_ids[b]
+                pmask_b = torch.zeros(start_pos, dtype=torch.bool)
+                pmask_ar_b = torch.cat([
+                    torch.zeros(L0, dtype=torch.bool),
+                    torch.ones_like(torch.empty(L1, dtype=torch.bool), dtype=torch.bool)
+                ], dim=0)
+                
+                for j in range(int((L1 - 1) / block_size) + 1):
+
+                    start = j * block_size
+                    end = min(L1, (j + 1) * block_size)
+
+                    pmask_b_j = torch.rand(end - start) <= torch.empty(end - start).uniform_(lower, upper)
+                    #pmask_b_j = torch.rand(end - start) <= torch.linspace(lower, upper, steps=end - start)
+                    pmask_b = torch.cat([pmask_b, pmask_b_j], dim=0)
+
+                    noise_b_j = input_ids[b, (L0 + start):(L0 + end)].clone()
+                    noise_b_j = noise_b_j.masked_fill_(pmask_b_j, mask_id)
+
+                    extended_input_ids_b = torch.cat([extended_input_ids_b, noise_b_j], dim=0)
+                
+                extended_input_ids_list.append(extended_input_ids_b)
+                pmask_list.append(pmask_b)
+                pmask_ar_list.append(pmask_ar_b)
             
-            # 1) Sample random numbers once for each position in the tail segment of this sample
-            rand_tail = torch.rand(L1)
-            pmask_tail = rand_tail <= prob_ramp  # [L1], True means to mask
+        if config.training.method == "coupled":
 
-            # 2) Construct the pmask for this sample (prefix all False, tail uses pmask_tail)
-            pmask_b = torch.cat([
-                torch.zeros(L0, dtype=torch.bool),
-                pmask_tail
-            ], dim=0)  # [L]
+            extended_input_ids_list, pmask_list, reward_list = [], [], []
+            coupled_input_ids_list, coupled_pmask_list, coupled_reward_list = [], [], []
 
-            pmask_ar_b = torch.cat([
-                torch.zeros(L0, dtype=torch.bool),
-                torch.ones_like(pmask_tail, dtype=torch.bool)
-            ], dim=0)
+            for b in range(B):
 
-            # 3) Construct the noisy tail and append it to the original sequence to get the extended sequence
-            noise_tail = input_ids[b, L0:].clone()            # [L1]
-            noise_tail.masked_fill_(pmask_tail, mask_id)      # Replace masked positions
-            extended_b = torch.cat([input_ids[b], noise_tail], dim=0)  # [L + L1]
+                reward_list.append(reward[b])
+                coupled_reward_list.append(reward[b])
 
-            extended_input_ids_list.append(extended_b)
-            pmask_list.append(pmask_b)
-            pmask_ar_list.append(pmask_ar_b)
+                extended_input_ids_b = input_ids[b]
+                pmask_b = torch.zeros(start_pos, dtype=torch.bool)
+
+                coupled_input_ids_b = input_ids[b]
+                coupled_pmask_b = torch.zeros(start_pos, dtype=torch.bool)
+                
+                for j in range(int((L1 - 1) / block_size) + 1):
+
+                    start = j * block_size
+                    end = min(L1, (j + 1) * block_size)
+
+                    pmask_b_j = torch.rand(end - start) <= torch.empty(end - start).uniform_(lower, upper)
+                    #pmask_b_j = torch.rand(end - start) <= torch.linspace(lower, upper, steps=end - start)
+                    pmask_b = torch.cat([pmask_b, pmask_b_j], dim=0)
+                    coupled_pmask_b = torch.cat([coupled_pmask_b, ~pmask_b_j], dim=0)
+
+                    noise_b_j = input_ids[b, (L0 + start):(L0 + end)].clone()
+                    noise_b_j = noise_b_j.masked_fill_(pmask_b_j, mask_id)
+
+                    coupled_noise_b_j = input_ids[b, (L0 + start):(L0 + end)].clone()
+                    coupled_noise_b_j = coupled_noise_b_j.masked_fill_(~pmask_b_j, mask_id)
+
+                    extended_input_ids_b = torch.cat([extended_input_ids_b, noise_b_j], dim=0)
+                    coupled_input_ids_b  = torch.cat([coupled_input_ids_b, coupled_noise_b_j], dim=0)
+                
+                extended_input_ids_list.append(extended_input_ids_b)
+                pmask_list.append(pmask_b)
+
+                coupled_input_ids_list.append(coupled_input_ids_b)
+                coupled_pmask_list.append(coupled_pmask_b)
+            
+            extended_input_ids_list += coupled_input_ids_list
+            pmask_list += coupled_pmask_list
+            reward_list += coupled_reward_list
+        
+        elif config.training.method == "TraceRL":
+
+            for b in range(B):
+                step_map_i = step_map_list[b]
+
+                for j in range(int((L1 - 1) / block_size) + 1):
+                    start = j * block_size
+                    end = min(L1, (j + 1) * block_size)
+                    step_map_list[b][start:end] = collapse_k_unique(step_map_i[start:end], config.training.shrink)
+            
+            step_map = torch.as_tensor(step_map_list, dtype=torch.long)
+
+            assert step_map.shape[1] == L1
+
+            extended_input_ids_list, pmask_list, reward_list = [], [], []
+
+            for b in range(B):
+                step_b = step_map[b]
+                while True:
+                    out = one_round_vectorized(
+                        input_ids_b=input_ids[b],
+                        step_map_b=step_b,
+                        L0=L0,
+                        L1=L1,
+                        block_size=block_size,
+                        mask_id=mask_id,
+                    )
+                    extended_b, pmask_b, step_b, has_any = out
+                    if not has_any:
+                        break
+
+                    extended_input_ids_list.append(extended_b)
+                    pmask_list.append(pmask_b)
+                    reward_list.append(reward[b])
 
         extended_input_ids = torch.stack(extended_input_ids_list, dim=0)
         p_mask =  torch.stack(pmask_list, dim=0).to(torch.bool)
@@ -418,6 +582,7 @@ def main():
             cum_pad_ar = torch.cumsum(pad_resp_ar.int(), dim=1)
             p_mask &= ~(pad_resp & (cum_pad > post_num))
             p_mask_ar &= ~(pad_resp_ar & (cum_pad_ar > post_num))
+        
         labels = extended_input_ids[:, :L].clone()
 
         idx = torch.arange(L).unsqueeze(0).expand(extended_input_ids.shape[0], -1)
@@ -428,23 +593,26 @@ def main():
         tok_idx_ext  = torch.cat([tok_idx, tok_idx_resp], dim=1)
 
         keep = p_mask.view(p_mask.size(0), -1).any(dim=1)
+        idx  = keep.nonzero(as_tuple=True)[0]          # LongTensor of indices
 
-        extended_input_ids = extended_input_ids[keep]
-        p_mask            = p_mask[keep]
-        tok_idx_ext       = tok_idx_ext[keep]
-        labels            = labels[keep]
-        p_mask_ar         = p_mask_ar[keep]
+        extended_input_ids = extended_input_ids[idx]
+        p_mask            = p_mask[idx]
+        tok_idx_ext       = tok_idx_ext[idx]
+        labels            = labels[idx]
+        p_mask_ar         = p_mask_ar[idx]
 
-        return extended_input_ids, p_mask, tok_idx_ext, labels, p_mask_ar
+        reward_list = [reward_list[i] for i in idx.tolist()]
+
+        return extended_input_ids, p_mask, p_mask_ar, tok_idx_ext, labels, reward_list
         
 
-    
-    extended_input_ids, p_mask, tok_idx_ext, labels, p_mask_ar = collect_training_data(input_ids_lm, step_map_list)
+
+    extended_input_ids, p_mask, p_mask_ar, tok_idx_ext, labels, rewards = collect_training_data(input_ids_lm, step_map_list, reward_list)
 
 
 
 
-    dataset_lm = TrainDataset(extended_input_ids, p_mask, tok_idx_ext, labels, p_mask_ar)
+    dataset_lm = TrainDataset(extended_input_ids, p_mask, tok_idx_ext, labels, rewards, p_mask_ar)
 
     total_batch_size_lm = config.training.batch_size_lm * accelerator.num_processes * config.training.gradient_accumulation_steps
     num_update_steps_per_epoch = math.ceil(len(dataset_lm) / total_batch_size_lm)
@@ -483,6 +651,75 @@ def main():
 
 
 
+
+
+    import torch.nn.functional as F
+
+
+    @torch.no_grad()
+    def compute_logp_old_tok_parallel(
+            accelerator,
+            dataset,
+            train_dataloader_lm,
+            start_pos, pad_id,
+            batch_size):
+
+        model.eval()
+
+        dl = train_dataloader_lm
+
+        for batch in dl:
+            ids        = batch["ids"]         
+            extended_input_ids = batch["extended_input_ids"].to(accelerator.device)
+            p_mask = batch["p_mask"].to(accelerator.device)
+            tok_idx_ext = batch["tok_idx_ext"].to(accelerator.device)
+            labels = batch["labels"].to(accelerator.device)
+
+            B, L = p_mask.shape
+            L0    = start_pos
+            L1    = L - L0
+            device = extended_input_ids.device
+
+            attention_mask = basic_block_attention.clone()
+            attention_mask = attention_mask.repeat_interleave(B, dim=0).to(device)
+            attention_mask = process_pad(attention_mask, extended_input_ids)
+
+            logits = model(input_ids = extended_input_ids, attention_mask = attention_mask, position_ids = tok_idx_ext).logits
+            bd_logits = torch.cat([logits[:, :L0, :], logits[:, L0 + L1 :, :]], dim=1)  # (B, L0+L1, V)
+            bd_log_probs = F.log_softmax(bd_logits, dim=-1)
+            logp_tok  = bd_log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+            dataset.logp_old_tok_bd[ids] = logp_tok.float().cpu()
+
+            ar_logits = logits[:, :L0 + L1 - 1, :] # (B, L0+L1, V)
+            ar_log_probs = F.log_softmax(ar_logits, dim=-1)
+            ar_labels = labels[:, 1:L0 + L1]
+            logp_tok_ar  = ar_log_probs.gather(dim=-1, index=ar_labels.unsqueeze(-1)).squeeze(-1)
+            dataset.logp_old_tok_ar[ids] = logp_tok_ar.float().cpu()
+
+        accelerator.wait_for_everyone()
+
+        model.train()
+
+
+    #################################
+    #             Inference         #
+    #################################
+    logger.info("***** Running inference *****")
+
+    compute_logp_old_tok_parallel(
+        accelerator,
+        dataset_lm,
+        train_dataloader_lm,
+        start_pos=start_pos,
+        pad_id=pad_id,
+        batch_size=config.training.batch_size_lm,
+    )
+
+
+
+
+
+
     #################################
     #             Training          #
     #################################
@@ -490,7 +727,7 @@ def main():
     
     logger.info(f"  Num response = {len(dataset_load)}")
     logger.info(f"  Num sample dropped = {drop_num}")
-    logger.info(f"  Num training data = {extended_input_ids.shape[0]}")
+    logger.info(f"  Num training data = {input_ids_lm.shape[0]}")
     logger.info(f"  Num training steps = {max_train_steps}")
     logger.info(f"  Instantaneous batch size per device = {config.training.batch_size_lm}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size_lm}")
@@ -500,17 +737,14 @@ def main():
     data_time_m = AverageMeter()
     end = time.time()
 
-    import torch.nn.functional as F
-
-
-
-
+    
 
 
     
 
-    ''' To be updated
-    def forward_process(extended_input_ids, p_mask, tok_idx_ext, labels):
+    def forward_process(extended_input_ids, p_mask, p_mask_ar, tok_idx_ext, labels, adv, logp_old_tok_bd, logp_old_tok_ar):
+
+        adv = torch.as_tensor(adv, device=extended_input_ids.device).detach()
 
         B, L = p_mask.shape
         L0    = start_pos
@@ -521,62 +755,69 @@ def main():
         attention_mask = attention_mask.repeat_interleave(B, dim=0).to(device)
         attention_mask = process_pad(attention_mask, extended_input_ids)
 
-        labels_trim = labels[:, L0:].clone()                             # (B, L1)
-        resp_keep   = p_mask[:, L0:]                                        # (B, L1) True=训练
-        labels_trim[~resp_keep] = -100   
-
-        out = model(
-            input_ids      = extended_input_ids,
-            attention_mask = attention_mask,
-            position_ids   = tok_idx_ext,
-            labels         = labels_trim,    # 注意：这里与 logits_to_keep 对齐
-            logits_to_keep = L1,             # 关键：只算最后 L1 个 time steps
-            return_dict    = True,
-            use_cache      = False,
-        )
-
-        loss_lm = out.loss
-
-
-        tokens_kept = (labels_trim != -100).sum()
-        if tokens_kept > 0:
-            loss_lm = loss_lm * (tokens_kept.to(loss_lm.dtype) / B)
-
-        
-        return loss_lm
-    '''
-    
-
-    def forward_process(extended_input_ids, p_mask, tok_idx_ext, labels, p_mask_ar):
-
-        B, L = p_mask.shape
-        L0    = start_pos
-        L1    = L - L0
-        device = extended_input_ids.device
-
-        attention_mask = basic_block_attention.clone()
-        attention_mask = attention_mask.repeat_interleave(B, dim=0).to(device)
-        attention_mask = process_pad(attention_mask, extended_input_ids)
-
-        logits = model(input_ids = extended_input_ids, attention_mask = attention_mask, position_ids = tok_idx_ext).logits 
+        logits = model(input_ids = extended_input_ids, attention_mask = attention_mask, position_ids = tok_idx_ext).logits
+        # logits = torch.cat([logits[:, :L0, :], logits[:, L0 + L1 :, :]], dim=1)  # (B, L0+L1, V)
         ar_logits = logits[:, :L0+L1-1, :]
         diffuse_logits = torch.cat([logits[:, :L0, :], logits[:, L0 + L1 :, :]], dim=1)
-
-        # logits = torch.cat([logits[:, :L0, :], logits[:, L0 + L1 :, :]], dim=1)  # (B, L0+L1, V)
-
         log_probs_ar = F.log_softmax(ar_logits, dim=-1)
         log_probs_diffuse = F.log_softmax(diffuse_logits, dim=-1)
         ar_labels = labels[:, 1:]
-        logp_tok_ar  = log_probs_ar.gather(dim=-1, index=ar_labels.unsqueeze(-1)).squeeze(-1)     # (B, T)
-        logp_tok_diffuse = log_probs_diffuse.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1) 
-        loss_ar = - (logp_tok_ar * p_mask_ar[:, :L0+L1-1]).sum(dim=1)  / L1
-        # num_mask = torch.clamp(p_mask.sum(dim=1), min=1)
-        loss_diffuse = - (logp_tok_diffuse * p_mask).sum(dim=1) / L1
-        loss_lm = loss_ar + loss_diffuse
+        logp_new_tok_ar  = log_probs_ar.gather(dim=-1, index=ar_labels.unsqueeze(-1)).squeeze(-1)     # (B, T)
+        logp_new_tok_bd  = log_probs_diffuse.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)     # (B, T)
 
-        loss_lm = loss_lm.sum() / B
+        # log_probs = F.log_softmax(logits, dim=-1)
         
-        return loss_lm
+        # logp_new_tok  = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)     # (B, T)
+
+        ratio = logp_new_tok_ar - logp_old_tok_ar
+        ratio = torch.where(p_mask_ar[:, :L0+L1-1], ratio, torch.zeros_like(ratio)).clamp(-10.0, 10.0) # make it stable, inf * 0 -> none
+        ratio = torch.exp(ratio)          # (B, T)
+        clipped = torch.clamp(ratio, 1 - config.training.eps, 1 + config.training.eps)            # (B, T)
+        adv_tok = adv.unsqueeze(1)
+        surrogate_tok = torch.min(ratio * adv_tok, clipped * adv_tok)  # (B, T)
+        surrogate_tok = surrogate_tok * p_mask_ar[:, :L0+L1-1]
+        surrogate_tok = surrogate_tok.sum(dim=1) / L1
+        policy_loss_ar = - (surrogate_tok.sum() / B)
+
+
+        # # Calculate diffusion loss
+        # ratio   = logp_new_tok_bd - logp_old_tok_bd
+        # ratio = torch.where(p_mask, ratio, torch.zeros_like(ratio)).clamp(-10.0, 10.0) # make it stable, inf * 0 -> none
+        # ratio   = torch.exp(ratio)          # (B, T)
+        # clipped = torch.clamp(ratio, 1 - config.training.eps, 1 + config.training.eps)            # (B, T)
+        # adv_tok = adv.unsqueeze(1)
+        # surrogate_tok = torch.min(ratio * adv_tok, clipped * adv_tok)  # (B, T)
+        # surrogate_tok = surrogate_tok * p_mask
+        # # num_mask = torch.clamp(p_mask.sum(dim=1), min=1)
+        # surrogate_tok = surrogate_tok.sum(dim=1) / L1
+        # policy_loss_bd = - (surrogate_tok.sum() / B)
+        policy_loss_bd = torch.tensor(0.0, device=policy_loss_ar.device)
+
+        policy_loss = policy_loss_ar + policy_loss_bd
+
+        # KL penalty (optional)
+        kl_loss = torch.tensor(0.0, device=policy_loss.device)
+        if config.training.beta > 0:
+            # kl_seq_bd = logp_new_tok_bd - logp_old_tok_bd
+            # kl_seq_bd = torch.where(p_mask, kl_seq_bd, torch.zeros_like(kl_seq_bd))
+            # if config.training.use_kl_estimator_k3:
+            #     t = (-kl_seq_bd).clamp(-10.0, 10.0)
+            #     kl_seq_bd = t.exp() - 1.0 + kl_seq_bd
+            # kl_seq_bd = (kl_seq_bd * p_mask).sum(dim=1) / L1
+            # kl_loss = config.training.beta * kl_seq_bd.sum() / B
+
+            kl_seq_ar = logp_new_tok_ar - logp_old_tok_ar
+            kl_seq_ar = torch.where(p_mask_ar[:, :L0+L1-1], kl_seq_ar, torch.zeros_like(kl_seq_ar))
+            if config.training.use_kl_estimator_k3:
+                t = (-kl_seq_ar).clamp(-10.0, 10.0)
+                kl_seq_ar = t.exp() - 1.0 + kl_seq_ar
+            kl_seq_ar = (kl_seq_ar * p_mask_ar[:, :L0+L1-1]).sum(dim=1) / L1
+            kl_loss += config.training.beta * kl_seq_ar.sum() / B
+            total_loss = policy_loss + kl_loss
+        else:
+            total_loss = policy_loss
+
+        return total_loss
 
 
 
@@ -593,34 +834,47 @@ def main():
             train_dataloader_lm,
             desc=f"Epoch {epoch+1}/{num_train_epochs}",
             disable=not accelerator.is_local_main_process,
-            dynamic_ncols=True,         
-            leave=True                
+            dynamic_ncols=True,          
+            leave=True               
         )
         
         
 
         for step, batch in enumerate(progress_bar, start=1):
+            
+            # for loss calculation
 
             data_time_m.update(time.time() - end)
 
-
             extended_input_ids = batch["extended_input_ids"].to(accelerator.device)
             p_mask = batch["p_mask"].to(accelerator.device)
+            p_mask_ar = batch["p_mask_ar"].to(accelerator.device)
             tok_idx_ext = batch["tok_idx_ext"].to(accelerator.device)
             labels = batch["labels"].to(accelerator.device)
-            p_mask_ar = batch["p_mask_ar"].to(accelerator.device)
+            reward = batch["reward"]
+            old_lp_bd = dataset_lm.logp_old_tok_bd[batch["ids"].cpu()].to(accelerator.device)
+            old_lp_ar = dataset_lm.logp_old_tok_ar[batch["ids"].cpu()].to(accelerator.device)
+
+            if torch.isneginf(old_lp_bd).any().item():
+                print(old_lp_bd)
+            if torch.isneginf(old_lp_ar).any().item():
+                print(old_lp_ar)
 
             loss_lm = forward_process(
                     extended_input_ids=extended_input_ids,
                     p_mask=p_mask,
+                    p_mask_ar=p_mask_ar,
                     tok_idx_ext=tok_idx_ext,
                     labels=labels,
-                    p_mask_ar=p_mask_ar
+                    adv=reward,
+                    logp_old_tok_bd=old_lp_bd,
+                    logp_old_tok_ar=old_lp_ar,
                 )
-            # if step < 10:
-            print(loss_lm)
-            
-            
+            loss_lm = loss_lm / accelerator.gradient_accumulation_steps
+
+
+            if step < 10:
+                print(loss_lm)
             accelerator.backward(loss_lm)
 
             if (step + 1) % accelerator.gradient_accumulation_steps == 0:
@@ -641,6 +895,8 @@ def main():
 
     # save checkpoint at the end of training
     save_checkpoint(model, tokenizer, config, accelerator, config.model.optimized_name)
+    if config.experiment.current_epoch % config.experiment.save_every == 0:
+        save_checkpoint(model, tokenizer, config, accelerator, f"epoch-{config.experiment.current_epoch}")
 
     accelerator.end_training()
 
@@ -724,6 +980,7 @@ def save_checkpoint(model, tokenizer, config, accelerator, name):
             json.dump(metadata, f, indent=2)
 
         logger.info(f"Saved model + tokenizer to {save_dir}")
+
     
 
 

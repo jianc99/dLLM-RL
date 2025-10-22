@@ -106,7 +106,7 @@ class LLMEngine:
         logits = self.model_runner.call("run", scheduled_seqs, run_type)
         self.scheduler.postprocess(scheduled_seqs, logits, run_type)
         
-        finished_outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_seqs if seq.is_finished]
+        finished_outputs = [(seq.seq_id, seq.completion_token_ids, seq.number_forward_pass) for seq in scheduled_seqs if seq.is_finished]
         
         # Throughput calculation needs to be adapted for block-wise generation
         num_tokens = [self.scheduler.running[i].num_to_transfer if hasattr(self.scheduler.running[i], 'num_to_transfer') else 0 for i in range(len(self.scheduler.running))]
@@ -227,6 +227,8 @@ class LLMEngine:
             )
             if profile else nullcontext()
         )
+        global_forward_pass = 0
+        global_generated_length = 0
 
         with prof_ctx as prof:
             while not self.is_finished() or pending_idx < total:
@@ -248,9 +250,11 @@ class LLMEngine:
                     pbar.set_postfix({"Throughput": f"{int(throughput)} tok/s"})
                     pbar.update(len(output))
 
-                for seq_id, token_ids in output:
+                for seq_id, token_ids, num_forward_pass in output:
                     outputs[seq_id] = token_ids
-
+                    global_forward_pass += num_forward_pass
+                    global_generated_length += len(token_ids)
+        print(f"Average number of tokens generated per forward pass: {global_generated_length / global_forward_pass:.2f}")
         outputs_list = [outputs[seq_id] for seq_id in sorted(outputs)]
         results = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs_list]
 

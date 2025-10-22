@@ -80,6 +80,7 @@ class Scheduler:
                     probs = self.sample_pipe_topk0(logits, temperature=seqs[0].temperature, top_p=seqs[0].top_p)
             for seq in seqs:
                 # Extract the part of the tensors relevant to this sequence
+                seq.number_forward_pass += 1
                 if seq.status == SequenceStatus.DENOISING:
                     block_len = seq.block_length
                     if not self.consistent_sampling_params:

@@ -570,8 +570,8 @@ def main():
         logp_tok_ar  = log_probs_ar.gather(dim=-1, index=ar_labels.unsqueeze(-1)).squeeze(-1)     # (B, T)
         logp_tok_diffuse = log_probs_diffuse.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1) 
         loss_ar = - (logp_tok_ar * p_mask_ar[:, :L0+L1-1]).sum(dim=1)  / L1
-        num_mask = torch.clamp(p_mask.sum(dim=1), min=1)
-        loss_diffuse = - (logp_tok_diffuse * p_mask).sum(dim=1) / num_mask
+        # num_mask = torch.clamp(p_mask.sum(dim=1), min=1)
+        loss_diffuse = - (logp_tok_diffuse * p_mask).sum(dim=1) / L1
         loss_lm = loss_ar + loss_diffuse
 
         loss_lm = loss_lm.sum() / B

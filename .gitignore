@@ -4,3 +4,4 @@ sft_sdar/
 data/*.json
 sdar_eval/
 sft_*/
+rl_*/
