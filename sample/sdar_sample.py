@@ -554,8 +554,16 @@ if __name__ == "__main__":
         ctx = mp.get_context("spawn")
         enforce_eager_local = False if tp > 1 else True
 
-        base_port = 29000
-        store_ports = [base_port + g for g in range(ngroups)]
+        store_ports = []
+        for _ in range(ngroups):
+            # Ensure each worker gets a rendezvous port that is actually free to avoid EADDRINUSE.
+            for _ in range(16):
+                candidate = _find_free_port()
+                if candidate not in store_ports:
+                    store_ports.append(candidate)
+                    break
+            else:
+                raise RuntimeError("Failed to allocate a unique rendezvous port for rollout workers.")
 
         out_q = ctx.Queue()
         procs = []
